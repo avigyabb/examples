@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 import pandas as pd
+import pyarrow.dataset as pa_ds
 from loguru import logger
 from PIL import Image
 from tqdm import tqdm
@@ -121,29 +122,61 @@ def download_webdataset(
     entries_per_tar: int = 10000,
     num_processes: int = 2,
 ) -> None:
+    """Stream a large Parquet of URLs/TEXT into WebDataset tar shards.
+
+    Uses pyarrow dataset streaming to avoid loading the entire Parquet into memory,
+    so it can scale to 100M+ rows (e.g., LAION subsets).
+    """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Read the parquet file
-    df = pd.read_parquet(parquet_path)
-    print(f"Loaded {len(df)} entries from parquet file")
+    # Stream the Parquet in batches; resolve URL/TEXT in a case-insensitive way and map TEXT->caption if needed
+    dataset = pa_ds.dataset(parquet_path, format="parquet")
+    schema = dataset.schema
+    available = set(schema.names)
 
-    # Split the dataframe into chunks for multiprocessing
-    chunks = [
-        (batch_num, df[i : i + entries_per_tar]) for batch_num, i in enumerate(range(0, len(df), entries_per_tar))
-    ]
-    print(f"Split into {len(chunks)} chunks of {entries_per_tar} entries each")
+    def resolve_cols() -> list[str]:
+        resolved = []
+        for col in ["URL", "TEXT"]:
+            if col in available:
+                resolved.append(col)
+                continue
+            lower = col.lower()
+            if lower in available:
+                resolved.append(lower)
+                continue
+            if col.upper() == "TEXT" and "caption" in available:
+                resolved.append("caption")
+        if not resolved:
+            raise ValueError(f"No URL/TEXT-like columns found in {parquet_path}; available: {sorted(available)}")
+        return resolved
 
-    # Use multiprocessing to process chunks in parallel with progress tracking
+    resolved_cols = resolve_cols()
+    total_rows = dataset.count_rows()
+    total_chunks = math.ceil(total_rows / entries_per_tar) if total_rows is not None else None
+
+    def batch_iter():
+        batch_num = 0
+        for batch in dataset.to_batches(columns=resolved_cols, batch_size=entries_per_tar):
+            df = batch.to_pandas()
+            # normalize column names to URL/TEXT expected downstream
+            col_map: dict[str, str] = {}
+            if "url" in df.columns and "URL" not in df.columns:
+                col_map["url"] = "URL"
+            if "caption" in df.columns and "TEXT" not in df.columns:
+                col_map["caption"] = "TEXT"
+            df = df.rename(columns=col_map)
+            yield (batch_num, df)
+            batch_num += 1
+
     with Pool(processes=num_processes) as pool:
         func = partial(process_parquet_chunk, output_dir=output_dir)
-
-        # Use tqdm to track progress of chunk processing
-        list(tqdm(
-            pool.imap(func, chunks),
-            total=len(chunks),
+        for _ in tqdm(
+            pool.imap(func, batch_iter()),
+            total=total_chunks,
             desc="Processing chunks",
-            unit="chunk"
-        ))
+            unit="chunk",
+        ):
+            pass
 
     # Best-effort cleanup of legacy tmp dir from previous versions
     tmp_dir = os.path.join(output_dir, "tmp")

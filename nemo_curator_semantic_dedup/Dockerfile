@@ -42,23 +42,6 @@ snapshot_download('openai/clip-vit-large-patch14', local_dir=model_dir)"
 # Set environment variable for model directory
 ENV MODEL_DIR=/home/ray/model_weights
 
-# Download and prepare the example dataset from HuggingFace
-# Downloads MS COCO parquet, deduplicates URLs, and truncates to 100k rows
-RUN mkdir -p /home/ray/data && \
-    curl -L https://huggingface.co/datasets/ChristophSchuhmann/MS_COCO_2017_URL_TEXT/resolve/main/mscoco.parquet \
-         -o /home/ray/data/mscoco.parquet && \
-    python -c "\
-import pandas as pd; \
-df = pd.read_parquet('/home/ray/data/mscoco.parquet'); \
-deduped = df[~df['URL'].duplicated()]; \
-truncated = deduped[:100000]; \
-truncated.to_parquet('/home/ray/data/truncated_100k_mscoco.parquet'); \
-print(f'Created truncated dataset with {len(truncated)} rows')" && \
-    rm /home/ray/data/mscoco.parquet
-
-# Create output directories
-RUN mkdir -p /home/ray/data/webdataset \
-             /home/ray/data/results \
-             /home/ray/data/embeddings \
-             /home/ray/data/removal_ids
+# For LAION runs, the input parquet (e.g., laion_subset_10m.parquet) is provided
+# via working_dir upload or external storage; no dataset is baked into the image.
 
